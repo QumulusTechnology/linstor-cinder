@@ -37,6 +37,8 @@ from cinder.volume import configuration
 from cinder.volume import driver
 from cinder.volume.targets import driver as targets
 from cinder.volume import volume_utils
+from cinder import objects
+from cinder.objects import fields
 
 try:
     import linstor
@@ -523,7 +525,10 @@ class LinstorDriver(driver.VolumeDriver):
             volume['name'],
             volume['id'],
         )
-        rsc.delete(snapshots=False)
+        try :
+            rsc.delete(snapshots=False)
+        except linstor.LinstorError as e:
+            raise exception.VolumeIsBusy(volume_name=volume['name'])
 
         try:
             rg = linstor.ResourceGroup(
@@ -564,10 +569,19 @@ class LinstorDriver(driver.VolumeDriver):
             snapshot['volume']['name'],
             snapshot['volume_id'],
         )
-        rsc.snapshot_delete(snapshot['name'])
-        # This could _also_ be a snapshot created by the v1 driver, so delete
-        # try to as well
-        rsc.snapshot_delete('SN_' + snapshot['id'])
+
+        try:
+            rsc.snapshot_delete(snapshot['name'])
+        except linstor.LinstorError as e:
+            raise exception.SnapshotIsBusy(snapshot['name'])
+
+        try:
+            # This could _also_ be a snapshot created by the v1 driver, so delete
+            # try to as well
+            rsc.snapshot_delete('SN_' + snapshot['id'])
+        except linstor.LinstorError as e:
+            raise exception.SnapshotIsBusy('SN_' + snapshot['id'])
+
 
     @wrap_linstor_api_exception
     @volume_utils.trace
@@ -615,9 +629,24 @@ class LinstorDriver(driver.VolumeDriver):
         :param cinder.objects.volume.Volume volume: The new clone
         :param cinder.objects.volume.Volume src_vref: The volume to clone from
         """
-        temp_snap = {
-            'id': 'for-' + volume['id'],
-            'name': 'for-' + volume['id'],
+
+        ctxt = volume._context
+
+        snapshot = objects.Snapshot(ctxt)
+        snapshot.user_id = ctxt.user_id
+        snapshot.project_id = ctxt.project_id
+        snapshot.volume_id = src_vref['id']
+        snapshot.volume_size = src_vref['size']
+        snapshot.display_name = 'for-' + volume['id']
+        snapshot.status = fields.SnapshotStatus.CREATING
+        snapshot.create()
+
+        snapshot.status = fields.SnapshotStatus.AVAILABLE
+        snapshot.save()
+
+        clone_snap = {
+            'id': snapshot['id'],
+            'name': 'snapshot-' + snapshot['id'],
             'volume': {
                 'name': src_vref['name'],
                 'id': src_vref['id'],
@@ -625,11 +654,15 @@ class LinstorDriver(driver.VolumeDriver):
             'volume_id': src_vref['id'],
         }
 
-        try:
-            self.create_snapshot(temp_snap)
-            return self.create_volume_from_snapshot(volume, temp_snap)
-        finally:
-            self.delete_snapshot(temp_snap)
+        self.create_snapshot(clone_snap)
+
+        volume.source_volid = None
+        volume.source_volstatus = None
+        volume.snapshot_id = snapshot['id']
+        volume.save()
+
+        return self.create_volume_from_snapshot(volume, snapshot)
+
 
     @wrap_linstor_api_exception
     @volume_utils.trace
