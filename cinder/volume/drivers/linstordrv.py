@@ -89,9 +89,9 @@ linstor_opts = [
                 help='True, if the driver should assume udev created links'
                      'always exist.'),
     
-    cfg.BoolOpt('linstor_use_zfs_clone',
+    cfg.BoolOpt('linstor_use_snapshot_based_clone',
                 default=False,
-                help='True, if the driver should use fast zfs clone with snapshot (dependent clone)')
+                help='True, if the driver should use clone with snapshot (dependent clone)')
     
 ]
 
@@ -265,8 +265,8 @@ class LinstorDriver(driver.VolumeDriver):
         return self.configuration.safe_get('linstor_force_udev') 
      
     @property
-    def _use_zfs_clone(self):
-        return self.configuration.safe_get('linstor_use_zfs_clone')  
+    def _use_snapshot_based_clone(self):
+        return self.configuration.safe_get('linstor_use_snapshot_based_clone')  
 
 
     @volume_utils.trace
@@ -341,14 +341,7 @@ class LinstorDriver(driver.VolumeDriver):
                         'storage',
             type='str',
         )
-        self._set_property(
-            self._vendor_properties,
-            'linstor:UseZFSClone',
-            title='Use ZFS Clone',
-            description='Use fast zfs clone with snapshot (dependent clone)',
-            type='bool',
-            default=False,
-        )
+
         return self._vendor_properties, 'linstor'
 
     def _get_linstor_property(self, name, volume_type):
@@ -649,19 +642,55 @@ class LinstorDriver(driver.VolumeDriver):
         :param cinder.objects.volume.Volume src_vref: The volume to clone from        
         """
       
-        rsc = _get_existing_resource(
-            self.c.get(),
-            src_vref['name'],
-            src_vref['id'],
-            )
-        
-        use_zfs_clone=self.configuration.safe_get('linstor_use_zfs_clone')
 
-        try :
-            rsc.clone(volume['name'],use_zfs_clone=use_zfs_clone)
-        except linstor.LinstorError:
-            LOG.error('failed to clone volume ')
-            raise              
+        
+        use_snapshot_based_clone=self.configuration.safe_get('linstor_use_snapshot_based_clone')
+
+        if use_snapshot_based_clone:
+            ctxt = volume._context
+
+            snapshot = objects.Snapshot(ctxt)
+            snapshot.user_id = ctxt.user_id
+            snapshot.project_id = ctxt.project_id
+            snapshot.volume_id = src_vref['id']
+            snapshot.volume_size = src_vref['size']
+            snapshot.display_name = 'for-' + volume['id']
+            snapshot.status = fields.SnapshotStatus.CREATING
+            snapshot.create()
+
+            snapshot.save()
+
+            clone_snap = {
+                'id': snapshot['id'],
+                'name': 'snapshot-' + snapshot['id'],
+                'volume': {
+                    'name': src_vref['name'],
+                    'id': src_vref['id'],
+                },
+                'volume_id': src_vref['id'],
+            }
+
+            self.create_snapshot(clone_snap)
+
+            snapshot.status = fields.SnapshotStatus.AVAILABLE
+
+            volume.source_volid = None
+            volume.source_volstatus = None
+            volume.snapshot_id = snapshot['id']
+            volume.save()
+
+            return self.create_volume_from_snapshot(volume, snapshot)            
+        else:
+            rsc = _get_existing_resource(
+                self.c.get(),
+                src_vref['name'],
+                src_vref['id'],
+            )
+            try :
+                rsc.clone(volume['name'],use_zfs_clone=False)
+            except linstor.LinstorError:
+                LOG.error('failed to clone volume ')
+                raise              
 
     @wrap_linstor_api_exception
     @volume_utils.trace
