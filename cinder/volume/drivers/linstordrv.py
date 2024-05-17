@@ -497,7 +497,7 @@ class LinstorDriver(driver.VolumeDriver):
             snapshot['volume']['name'],
             snapshot['volume_id'],
         )
-
+        
         try:
             rsc = _restore_snapshot_to_new_resource(
                 src, snapshot, volume['name'],
@@ -675,13 +675,31 @@ class LinstorDriver(driver.VolumeDriver):
 
             return self.create_volume_from_snapshot(volume, snapshot)
         else:
-            rsc = _get_existing_resource(
+            src = _get_existing_resource(
                 self.c.get(),
                 src_vref['name'],
                 src_vref['id'],
             )
-            rsc.clone(volume['name'], use_zfs_clone=False)
 
+            try:
+                src.clone(volume['name'], use_zfs_clone=False)
+
+                clone = _get_existing_resource(
+                    self.c.get(),
+                    volume['name'],
+                    existing_client=self.c.get(),
+                )
+                
+                if clone.volumes[0].size < expected_size:
+                    clone.volumes[0].size = expected_size
+                    
+            except linstor.LinstorError:
+                # Ensure we don't have invalid volumes lying around in the backend
+                LOG.exception('Could not clone Linstor volume, '
+                              'deleting clone')
+                clone.delete()
+                raise
+            
     @wrap_linstor_api_exception
     @volume_utils.trace
     def copy_image_to_volume(self, context, volume, image_service, image_id,
